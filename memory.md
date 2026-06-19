@@ -72,6 +72,16 @@ The goal is to build a local, web-based tool that:
 - **Problem**: Client-side interval polling (`setInterval`) for model downloads and image generation jobs was chatty, resource-intensive, and out-of-sync.
 - **Solution**: Replaced polling with standard Server-Sent Events (`SSE`). The backend in `main.py` exposes a single `/api/stream` endpoint returning a `StreamingResponse` (yielding JSON-serialized states). The React frontend binds to it using `EventSource`. This provides smooth, low-latency, real-time progress updates without client-side query loops.
 
+### D. Download Registry & Resume Flow
+- **Problem**: Large model downloads (0.5GB to 5GB+) were lost if the application closed or the backend server crashed mid-download, requiring a complete download restart.
+- **Solution**: Added `models_cache/download_registry.json`. On start, the server queries snapshot directories to see what files are already fully downloaded (skipping them). During resume, progress accumulator starts at the size of completed files, and the monkey-patched `tqdm` automatically registers resumed ranges, allowing the UI progress bar to jump directly to the correct starting offset.
+- **Robustness**: Writes to registry are saved atomically using a temporary file and `os.replace` to prevent file corruption/truncation on sudden shutdowns.
+
+### E. Real-Time System Log Terminal Console
+- **Problem**: Generation jobs and local model loads take significant time, and the user had no visual cues of what the model was doing at any given second.
+- **Solution**: Created a thread-safe global in-memory log buffer (`backend/logger.py`) and injected log statements in all pipelines (downloader, prompt parser, image renderer, config updater). The logs are serialized and pushed to the frontend via the `/api/stream` SSE channel. The React frontend visualizes them in a glassmorphic monospaced terminal at the bottom of the workspace, complete with category-specific coloring and filter controls.
+- **Robustness (Unicode print error safety)**: The logging function is fully wrapped in exception handlers. When printing logs to standard output, CP1252-based Windows terminals can throw `UnicodeEncodeError` or `OSError` if messages contain emojis (like clipboard `📋`) or foreign characters. `add_log` intercepts print failures and falls back to printing ASCII replacement strings, keeping the main generation pipeline completely uninterrupted.
+
 ---
 
 ## 5. Next Steps & Ideas for Enhancement

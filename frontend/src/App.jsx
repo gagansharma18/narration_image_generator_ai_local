@@ -13,7 +13,11 @@ import {
   ChevronRight, 
   Edit3, 
   ZoomIn,
-  Loader
+  Loader,
+  Terminal,
+  Trash2,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
 
 export default function App() {
@@ -58,12 +62,26 @@ export default function App() {
   const [fullImageModal, setFullImageModal] = useState(null);
   const [isDownloadingZip, setIsDownloadingZip] = useState(false);
   
+  // System Logs States
+  const [logs, setLogs] = useState([]);
+  const [logFilter, setLogFilter] = useState('all');
+  const [isTerminalCollapsed, setIsTerminalCollapsed] = useState(false);
+  const terminalBodyRef = useRef(null);
+  
   const prevStatusRef = useRef('idle');
 
-  // Load config on mount
+  // Load config and logs on mount
   useEffect(() => {
     fetchConfig();
+    fetchLogs();
   }, []);
+
+  // Auto-scroll terminal to bottom when logs update
+  useEffect(() => {
+    if (terminalBodyRef.current) {
+      terminalBodyRef.current.scrollTop = terminalBodyRef.current.scrollHeight;
+    }
+  }, [logs, isTerminalCollapsed]);
 
   // Connect to SSE stream for real-time status updates (no more polling!)
   useEffect(() => {
@@ -92,6 +110,11 @@ export default function App() {
           const prevStatus = prevStatusRef.current;
           const nextStatus = data.job.status;
           
+          if (nextStatus === 'running') {
+            // Automatically switch step to 3 on mount/update if generation is currently running
+            setActiveStep(prev => prev === 1 || prev === 2 ? 3 : prev);
+          }
+          
           if (prevStatus === 'running' && nextStatus === 'completed') {
             setActiveStep(4);
             showNotification('Storyboard images generated successfully!', 'success');
@@ -100,6 +123,10 @@ export default function App() {
           }
           
           prevStatusRef.current = nextStatus;
+        }
+
+        if (data.logs) {
+          setLogs(data.logs);
         }
       } catch (err) {
         console.error('Error parsing SSE event:', err);
@@ -135,6 +162,35 @@ export default function App() {
       }
     } catch (err) {
       showNotification('Failed to load config file.', 'danger');
+    }
+  };
+
+  const fetchLogs = async () => {
+    try {
+      const res = await fetch('/api/logs');
+      if (res.ok) {
+        const data = await res.json();
+        setLogs(data);
+      }
+    } catch (err) {
+      console.error('Error fetching logs:', err);
+    }
+  };
+
+  const handleClearLogs = async () => {
+    try {
+      const res = await fetch('/api/logs/clear', { method: 'POST' });
+      if (res.ok) {
+        setLogs([{
+          timestamp: new Date().toLocaleTimeString(),
+          category: 'system',
+          level: 'INFO',
+          message: 'Log window cleared.'
+        }]);
+        showNotification('Logs cleared.', 'success');
+      }
+    } catch (err) {
+      console.error('Error clearing logs:', err);
     }
   };
 
@@ -407,15 +463,46 @@ export default function App() {
           {getStatusBadge(statusObj.status)}
         </div>
 
-        {(statusObj.status === 'downloading' || statusObj.status === 'interrupted') && (
+        {(statusObj.status === 'downloading' || statusObj.status === 'interrupted' || statusObj.status === 'fetching_info' || statusObj.status === 'queued') && (
           <div style={{ marginTop: '0.75rem' }}>
-            <div className="progress-container">
-              <div className="progress-bar" style={{ width: `${statusObj.progress}%` }}></div>
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', marginTop: '0.35rem', color: 'var(--text-secondary)' }}>
-              <span>{formatSize(statusObj.downloaded)} of {formatSize(statusObj.total_size)}</span>
-              <span>{Math.round(statusObj.progress)}%</span>
-            </div>
+            {(statusObj.status === 'downloading' || statusObj.status === 'interrupted') && (
+              <>
+                <div className="progress-container">
+                  <div className="progress-bar" style={{ width: `${statusObj.progress}%` }}></div>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', marginTop: '0.35rem', color: 'var(--text-secondary)' }}>
+                  <span>{formatSize(statusObj.downloaded)} of {formatSize(statusObj.total_size)}</span>
+                  <span>{Math.round(statusObj.progress)}%</span>
+                </div>
+              </>
+            )}
+            
+            {(statusObj.status === 'downloading' || statusObj.status === 'fetching_info' || statusObj.status === 'queued') && (
+              <button
+                className="btn btn-secondary"
+                style={{
+                  width: '100%',
+                  marginTop: '0.75rem',
+                  fontSize: '0.8rem',
+                  padding: '0.35rem',
+                  color: '#EF4444',
+                  borderColor: 'rgba(239, 68, 68, 0.3)',
+                  background: 'rgba(239, 68, 68, 0.05)'
+                }}
+                onClick={async () => {
+                  try {
+                    const res = await fetch(`/api/models/cancel?repo_id=${encodeURIComponent(activeRepo)}`, { method: 'POST' });
+                    if (res.ok) {
+                      showNotification(`Cancelled downloading ${activeRepo}`, 'warning');
+                    }
+                  } catch (err) {
+                    showNotification('Failed to cancel download.', 'danger');
+                  }
+                }}
+              >
+                Cancel Download
+              </button>
+            )}
           </div>
         )}
 
@@ -443,6 +530,99 @@ export default function App() {
               ? `Resume Download (${Math.round(statusObj.progress)}% completed)` 
               : 'Download / Verify Model Cache'}
           </button>
+        )}
+      </div>
+    );
+  };
+
+  const renderTerminalWindow = () => {
+    // Filter logs based on category
+    const filteredLogs = logs.filter(log => {
+      if (logFilter === 'all') return true;
+      return log.category === logFilter;
+    });
+
+    return (
+      <div className="terminal-window">
+        <div className="terminal-header">
+          <div className="terminal-title">
+            <span className="terminal-indicator"></span>
+            <Terminal size={14} />
+            <span>SYSTEM MONITORING CONSOLE</span>
+          </div>
+          <div className="terminal-actions">
+            <button 
+              className="icon-btn" 
+              onClick={handleClearLogs} 
+              title="Clear Console"
+              style={{ padding: '0.2rem', color: 'var(--text-muted)' }}
+            >
+              <Trash2 size={14} />
+            </button>
+            <button 
+              className="icon-btn" 
+              onClick={() => setIsTerminalCollapsed(!isTerminalCollapsed)} 
+              title={isTerminalCollapsed ? "Expand Console" : "Collapse Console"}
+              style={{ padding: '0.2rem', color: 'var(--text-muted)' }}
+            >
+              {isTerminalCollapsed ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+            </button>
+          </div>
+        </div>
+
+        {!isTerminalCollapsed && (
+          <>
+            <div className="terminal-filter-bar">
+              <button 
+                className={`terminal-filter-btn ${logFilter === 'all' ? 'active' : ''}`}
+                onClick={() => setLogFilter('all')}
+              >
+                ALL LOGS ({logs.length})
+              </button>
+              <button 
+                className={`terminal-filter-btn ${logFilter === 'downloader' ? 'active' : ''}`}
+                onClick={() => setLogFilter('downloader')}
+              >
+                DOWNLOADS ({logs.filter(l => l.category === 'downloader').length})
+              </button>
+              <button 
+                className={`terminal-filter-btn ${logFilter === 'llm' ? 'active' : ''}`}
+                onClick={() => setLogFilter('llm')}
+              >
+                SCRIPT ({logs.filter(l => l.category === 'llm').length})
+              </button>
+              <button 
+                className={`terminal-filter-btn ${logFilter === 'image' ? 'active' : ''}`}
+                onClick={() => setLogFilter('image')}
+              >
+                IMAGES ({logs.filter(l => l.category === 'image').length})
+              </button>
+              <button 
+                className={`terminal-filter-btn ${logFilter === 'system' ? 'active' : ''}`}
+                onClick={() => setLogFilter('system')}
+              >
+                SYSTEM ({logs.filter(l => l.category === 'system').length})
+              </button>
+            </div>
+            
+            <div className="terminal-body" ref={terminalBodyRef}>
+              {filteredLogs.length === 0 ? (
+                <div style={{ color: 'var(--text-muted)', fontSize: '0.8rem', fontStyle: 'italic', padding: '0.5rem 0' }}>
+                  No logs available for this filter.
+                </div>
+              ) : (
+                filteredLogs.map((log, index) => (
+                  <div key={index} className={`terminal-log-row log-level-${log.level.toLowerCase()}`}>
+                    <span className="log-timestamp">[{log.timestamp}]</span>
+                    <span className={`log-category log-category-${log.category}`}>
+                      {log.category}
+                    </span>
+                    <span className="log-message">{log.message}</span>
+                  </div>
+                ))
+              )}
+            </div>
+          </>
         )}
       </div>
     );
@@ -619,6 +799,7 @@ export default function App() {
               { id: 'meta-llama/Llama-3.2-1B-Instruct', label: 'Llama 3.2 1B Instruct [Disk: 2.2 GB | VRAM: ~2.5 GB]' },
               { id: 'TinyLlama/TinyLlama-1.1B-Chat-v1.0', label: 'TinyLlama 1.1B Chat [Disk: 2.2 GB | VRAM: ~2.5 GB]' },
               { id: 'Qwen/Qwen2.5-1.5B-Instruct', label: 'Qwen 2.5 1.5B Instruct [Disk: 2.8 GB | VRAM: ~3.5 GB]' },
+              { id: 'google/gemma-2-2b-it', label: 'Gemma 2 2B Instruct [Disk: 5.4 GB | VRAM: ~6.0 GB] (Gated)' },
               { id: 'Qwen/Qwen2.5-3B-Instruct', label: 'Qwen 2.5 3B Instruct [Disk: 5.8 GB | VRAM: ~6.5 GB]' },
               { id: 'meta-llama/Llama-3.2-3B-Instruct', label: 'Llama 3.2 3B Instruct [Disk: 6.2 GB | VRAM: ~7.0 GB]' }
             ],
@@ -686,14 +867,14 @@ export default function App() {
                 <button 
                   className="btn btn-primary" 
                   onClick={() => setActiveStep(2)}
-                  disabled={modelsStatus.image_model.status !== 'completed'}
+                  disabled={modelsStatus.image_model.status !== 'completed' || modelsStatus.text_model.status !== 'completed'}
                 >
                   Proceed to Script Input <ChevronRight size={16} />
                 </button>
               </div>
-              {modelsStatus.image_model.status !== 'completed' && (
+              {(modelsStatus.image_model.status !== 'completed' || modelsStatus.text_model.status !== 'completed') && (
                 <span style={{ fontSize: '0.8rem', color: 'var(--warning)', marginTop: '0.75rem', display: 'block' }}>
-                  * Image model download must be finished to proceed to step 2.
+                  * Both Text and Image model downloads must be finished to proceed to step 2.
                 </span>
               )}
             </div>
@@ -781,9 +962,34 @@ export default function App() {
                   <div className="progress-container" style={{ height: '10px' }}>
                     <div className="progress-bar" style={{ width: `${jobStatus.progress}%` }}></div>
                   </div>
-                  <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.5rem', display: 'block' }}>
-                    Generating scene {jobStatus.current_segment_index + 1} of {jobStatus.total_segments}... This can take 10-30s per image on CPU.
-                  </span>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '0.75rem' }}>
+                    <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                      Generating scene {jobStatus.current_segment_index + 1} of {jobStatus.total_segments}... This can take 10-30s per image on CPU.
+                    </span>
+                    <button
+                      className="btn btn-secondary"
+                      style={{
+                        fontSize: '0.8rem',
+                        padding: '0.35rem 0.75rem',
+                        color: '#EF4444',
+                        borderColor: 'rgba(239, 68, 68, 0.3)',
+                        background: 'rgba(239, 68, 68, 0.05)',
+                        margin: 0
+                      }}
+                      onClick={async () => {
+                        try {
+                          const res = await fetch('/api/jobs/cancel', { method: 'POST' });
+                          if (res.ok) {
+                            showNotification('Image generation cancel request sent.', 'warning');
+                          }
+                        } catch (err) {
+                          showNotification('Failed to cancel image generation.', 'danger');
+                        }
+                      }}
+                    >
+                      Stop Generation
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -905,6 +1111,9 @@ export default function App() {
           
         </main>
       </div>
+
+      {/* Real-time Console Log Terminal */}
+      {renderTerminalWindow()}
 
       {/* Expanded Image Modal */}
       {fullImageModal && (

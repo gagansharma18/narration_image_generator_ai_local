@@ -1,7 +1,9 @@
 import torch
+import gc
 from pathlib import Path
 from diffusers import AutoPipelineForText2Image
 from backend.config import load_config, OUTPUT_DIR
+from backend.logger import add_log
 
 # Global variable to hold the loaded image pipeline
 _loaded_model_id = None
@@ -15,22 +17,44 @@ STYLE_PREFIX = (
     "and circles. Zero shading, zero 3D elements, zero cinematic lighting. Generate a 16:9 frame depicting: "
 )
 
+def unload_image_pipeline():
+    global _loaded_model_id, _pipeline
+    if _pipeline is not None:
+        add_log(f"Unloading Image Model '{_loaded_model_id}' from VRAM to free GPU memory...", "image")
+        _pipeline = None
+        _loaded_model_id = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        add_log("Image Model successfully unloaded and CUDA memory cache flushed.", "image")
+
 def load_image_pipeline(model_id: str, hf_token: str = None):
     global _loaded_model_id, _pipeline
     
     if _loaded_model_id == model_id and _pipeline is not None:
+        add_log(f"Image Model '{model_id}' is already loaded in memory.", "image")
         return _pipeline
         
-    print(f"Loading local Image Model: {model_id}...")
+    # Unload LLM model to free VRAM before loading the image pipeline
+    try:
+        from backend.llm_handler import unload_llm
+        unload_llm()
+    except Exception as e:
+        print(f"Exception unloading LLM: {e}")
+        
+    config = load_config()
+    use_gpu = config.get("use_gpu", False)
+    device = "cuda" if (use_gpu and torch.cuda.is_available()) else "cpu"
     
-    # Check if GPU is available
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    add_log(f"Loading Image Model '{model_id}' on {device.upper()} (this may take a few minutes)...", "image")
     
-    # Load pipeline
+    # Load pipeline with appropriate data type (float16 on GPU is faster and saves VRAM)
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    
     pipe = AutoPipelineForText2Image.from_pretrained(
         model_id,
         token=hf_token if hf_token else None,
-        torch_dtype=torch.float32,  # CPU prefers float32
+        torch_dtype=dtype,
         use_safetensors=True
     )
     
@@ -38,11 +62,12 @@ def load_image_pipeline(model_id: str, hf_token: str = None):
     
     if device == "cpu":
         # CPU memory optimizations
+        add_log("CPU mode detected. Enabling attention slicing to save memory.", "image")
         pipe.enable_attention_slicing()
         
     _loaded_model_id = model_id
     _pipeline = pipe
-    print(f"Image Model loaded successfully on {device}.")
+    add_log(f"Image Model '{model_id}' loaded successfully on {device.upper()}.", "image")
     return _pipeline
 
 def generate_image_for_prompt(visual_prompt: str, filename: str, custom_model_id: str = None) -> Path:
@@ -80,7 +105,7 @@ def generate_image_for_prompt(visual_prompt: str, filename: str, custom_model_id
     else:
         width, height = 768, 432  # Standard 16:9
         
-    print(f"Generating image. Prompt: {visual_prompt[:60]}... Model: {model_id}, Steps: {num_steps}, Size: {width}x{height}")
+    add_log(f"Running image inference for prompt: '{visual_prompt[:60]}...' using '{model_id}' (Steps: {num_steps}, Size: {width}x{height})", "image")
     
     # Run pipeline
     output = pipe(
@@ -96,6 +121,6 @@ def generate_image_for_prompt(visual_prompt: str, filename: str, custom_model_id
     # Ensure save path exists
     save_path = OUTPUT_DIR / filename
     image.save(save_path)
-    print(f"Image saved successfully to {save_path}")
+    add_log(f"Image successfully generated and saved to '{filename}'", "image")
     
     return save_path
