@@ -1,6 +1,7 @@
 import threading
 import time
 import os
+import json
 from pathlib import Path
 from huggingface_hub import HfApi, snapshot_download
 import huggingface_hub.utils.tqdm
@@ -14,9 +15,45 @@ _original_update = tqdm.tqdm.update
 active_download_repo = None
 downloaded_bytes_accumulator = 0
 download_status = {}
+last_saved_time = 0
+
+REGISTRY_FILE = MODELS_CACHE_DIR / "download_registry.json"
+
+DEFAULT_MODEL_SIZES = {
+    "Qwen/Qwen2.5-0.5B-Instruct": 999604166,
+    "meta-llama/Llama-3.2-1B-Instruct": 2420000000,
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": 2200000000,
+    "Qwen/Qwen2.5-1.5B-Instruct": 2800000000,
+    "Qwen/Qwen2.5-3B-Instruct": 5800000000,
+    "meta-llama/Llama-3.2-3B-Instruct": 6200000000,
+    "stabilityai/sd-turbo": 2000000000,
+    "runwayml/stable-diffusion-v1-5": 4270000000,
+    "Lykon/dreamshaper-8": 4270000000,
+    "stabilityai/sdxl-turbo": 6900000000
+}
+
+def load_registry() -> dict:
+    if not REGISTRY_FILE.exists():
+        return {}
+    try:
+        with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading download registry: {e}")
+        return {}
+
+def save_registry(registry: dict):
+    try:
+        MODELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        temp_file = REGISTRY_FILE.with_suffix(".tmp")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(registry, f, indent=4)
+        os.replace(temp_file, REGISTRY_FILE)
+    except Exception as e:
+        print(f"Error saving download registry: {e}")
 
 def patched_update(self, n=1):
-    global downloaded_bytes_accumulator
+    global downloaded_bytes_accumulator, last_saved_time
     _original_update(self, n)
     try:
         # Avoid crashing if n is None
@@ -31,6 +68,19 @@ def patched_update(self, n=1):
                 progress = (downloaded / total) * 100
                 download_status[repo]["progress"] = min(99.0, progress)
                 download_status[repo]["downloaded"] = downloaded
+                
+                # Periodically save progress to the persistent registry file
+                current_time = time.time()
+                if current_time - last_saved_time > 5.0:
+                    last_saved_time = current_time
+                    registry = load_registry()
+                    registry[repo] = {
+                        "status": "downloading",
+                        "progress": min(99.0, progress),
+                        "downloaded": downloaded,
+                        "total_size": total
+                    }
+                    save_registry(registry)
     except Exception as e:
         print(f"Exception in tqdm monkey-patch update: {e}")
 
@@ -46,23 +96,41 @@ def get_directory_size(path: Path) -> int:
     total_size = 0
     if not path.exists():
         return 0
+    seen_real_paths = set()
     for dirpath, _, filenames in os.walk(path):
         for f in filenames:
             fp = os.path.join(dirpath, f)
-            # Skip symlinks to avoid duplicate counting
-            if not os.path.islink(fp):
-                try:
-                    total_size += os.path.getsize(fp)
-                except OSError:
-                    pass
+            try:
+                # Resolve symlinks to get the real file in blobs and avoid duplicate counting
+                real_fp = os.path.realpath(fp)
+                if real_fp not in seen_real_paths:
+                    seen_real_paths.add(real_fp)
+                    if os.path.exists(real_fp) and not real_fp.endswith(".incomplete"):
+                        total_size += os.path.getsize(real_fp)
+            except OSError:
+                pass
     return total_size
 
 def download_worker(repo_id: str, hf_token: str):
     global active_download_repo, downloaded_bytes_accumulator
     active_download_repo = repo_id
-    downloaded_bytes_accumulator = 0
+    
+    # Calculate size of already completed files in cache to set the initial accumulator
+    repo_dir = MODELS_CACHE_DIR / "hub" / get_repo_folder_name(repo_id)
+    snapshots_dir = repo_dir / "snapshots"
+    downloaded_bytes_accumulator = get_directory_size(snapshots_dir)
     try:
         download_status[repo_id]["status"] = "fetching_info"
+        
+        # Save initial state in registry
+        registry = load_registry()
+        registry[repo_id] = {
+            "status": "fetching_info",
+            "progress": 0.0,
+            "downloaded": 0,
+            "total_size": 0
+        }
+        save_registry(registry)
         
         # Get repository files info to calculate total size
         api = HfApi()
@@ -72,10 +140,19 @@ def download_worker(repo_id: str, hf_token: str):
         total_size = sum(sibling.size for sibling in model_info.siblings if sibling.size is not None)
         # Fallback if size not available
         if total_size == 0:
-            total_size = 3 * 1024 * 1024 * 1024  # Estimate 3GB if unknown
+            if repo_id in DEFAULT_MODEL_SIZES:
+                total_size = DEFAULT_MODEL_SIZES[repo_id]
+            else:
+                total_size = 3 * 1024 * 1024 * 1024  # Estimate 3GB if unknown
             
         download_status[repo_id]["total_size"] = total_size
         download_status[repo_id]["status"] = "downloading"
+        
+        # Update registry with total size
+        registry = load_registry()
+        registry[repo_id]["status"] = "downloading"
+        registry[repo_id]["total_size"] = total_size
+        save_registry(registry)
         
         # Perform actual download
         # snapshot_download will check cache and download missing files
@@ -90,10 +167,29 @@ def download_worker(repo_id: str, hf_token: str):
         download_status[repo_id]["progress"] = 100.0
         download_status[repo_id]["downloaded"] = total_size
         
+        registry = load_registry()
+        registry[repo_id] = {
+            "status": "completed",
+            "progress": 100.0,
+            "downloaded": total_size,
+            "total_size": total_size
+        }
+        save_registry(registry)
+        
     except Exception as e:
         download_status[repo_id]["status"] = "failed"
         download_status[repo_id]["error"] = str(e)
         print(f"Error downloading {repo_id}: {e}")
+        
+        registry = load_registry()
+        registry[repo_id] = {
+            "status": "interrupted",
+            "progress": download_status[repo_id].get("progress", 0.0),
+            "downloaded": download_status[repo_id].get("downloaded", 0),
+            "total_size": download_status[repo_id].get("total_size", 0),
+            "error": str(e)
+        }
+        save_registry(registry)
     finally:
         if active_download_repo == repo_id:
             active_download_repo = None
@@ -119,28 +215,101 @@ def trigger_download(repo_id: str):
     return download_status[repo_id]
 
 def get_download_status(repo_id: str):
-    # Check if directory exists and download_status does not have it, we can say it is completed
     repo_dir = MODELS_CACHE_DIR / "hub" / get_repo_folder_name(repo_id)
+    snapshots_dir = repo_dir / "snapshots"
     
-    if repo_id not in download_status:
-        # Check if snapshots exist and are populated
-        snapshots_dir = repo_dir / "snapshots"
-        if snapshots_dir.exists() and any(snapshots_dir.iterdir()):
+    # 1. If active in memory
+    if repo_id in download_status:
+        return download_status[repo_id]
+        
+    # 2. Look up in persistent registry
+    registry = load_registry()
+    if repo_id in registry:
+        entry = registry[repo_id]
+        status = entry.get("status", "not_started")
+        
+        # If it was left in downloading/fetching_info state but we are not active, it's interrupted
+        if status in ["downloading", "fetching_info"]:
+            status = "interrupted"
+            
+        # Verify if files still exist
+        if status == "completed":
+            if not (snapshots_dir.exists() and any(snapshots_dir.iterdir())):
+                status = "not_started"
+                entry["progress"] = 0.0
+                entry["downloaded"] = 0
+                entry["total_size"] = 0
+                
+        return {
+            "progress": entry.get("progress", 0.0),
+            "status": status,
+            "total_size": entry.get("total_size", 0),
+            "downloaded": entry.get("downloaded", 0),
+            "error": entry.get("error", None)
+        }
+        
+    # 3. Fallback for pre-cached directories (not in registry)
+    if snapshots_dir.exists() and any(snapshots_dir.iterdir()):
+        folder_size = get_directory_size(snapshots_dir)
+        
+        # Check if it's a default model and matches expected size
+        if repo_id in DEFAULT_MODEL_SIZES:
+            expected_size = DEFAULT_MODEL_SIZES[repo_id]
+            if folder_size > 0.9 * expected_size:
+                # Add to registry to save state
+                registry[repo_id] = {
+                    "status": "completed",
+                    "progress": 100.0,
+                    "downloaded": folder_size,
+                    "total_size": folder_size
+                }
+                save_registry(registry)
+                return {
+                    "progress": 100.0,
+                    "status": "completed",
+                    "total_size": folder_size,
+                    "downloaded": folder_size,
+                    "error": None
+                }
+            else:
+                progress = min(99.0, (folder_size / expected_size) * 100)
+                registry[repo_id] = {
+                    "status": "interrupted",
+                    "progress": progress,
+                    "downloaded": folder_size,
+                    "total_size": expected_size
+                }
+                save_registry(registry)
+                return {
+                    "progress": progress,
+                    "status": "interrupted",
+                    "total_size": expected_size,
+                    "downloaded": folder_size,
+                    "error": None
+                }
+        else:
+            # Custom model downloaded before this feature - default to completed
+            registry[repo_id] = {
+                "status": "completed",
+                "progress": 100.0,
+                "downloaded": folder_size,
+                "total_size": folder_size
+            }
+            save_registry(registry)
             return {
                 "progress": 100.0,
                 "status": "completed",
-                "total_size": get_directory_size(repo_dir),
-                "downloaded": get_directory_size(repo_dir),
-                "error": None
-            }
-        else:
-            return {
-                "progress": 0.0,
-                "status": "not_started",
-                "total_size": 0,
-                "downloaded": 0,
+                "total_size": folder_size,
+                "downloaded": folder_size,
                 "error": None
             }
             
-    return download_status[repo_id]
+    # Default fallback
+    return {
+        "progress": 0.0,
+        "status": "not_started",
+        "total_size": 0,
+        "downloaded": 0,
+        "error": None
+    }
 

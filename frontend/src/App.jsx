@@ -330,6 +330,8 @@ export default function App() {
         return <span className="badge badge-info"><Loader size={12} className="spinner" style={{marginRight: 4}} /> Fetching HF Info</span>;
       case 'queued':
         return <span className="badge badge-info">Queued</span>;
+      case 'interrupted':
+        return <span className="badge" style={{background: 'rgba(245, 158, 11, 0.2)', color: '#F59E0B', display: 'inline-flex', alignItems: 'center'}}><AlertCircle size={12} style={{marginRight: 4}} /> Interrupted</span>;
       case 'failed':
         return <span className="badge badge-danger"><XCircle size={12} style={{marginRight: 4}} /> Error</span>;
       default:
@@ -405,7 +407,7 @@ export default function App() {
           {getStatusBadge(statusObj.status)}
         </div>
 
-        {statusObj.status === 'downloading' && (
+        {(statusObj.status === 'downloading' || statusObj.status === 'interrupted') && (
           <div style={{ marginTop: '0.75rem' }}>
             <div className="progress-container">
               <div className="progress-bar" style={{ width: `${statusObj.progress}%` }}></div>
@@ -427,10 +429,19 @@ export default function App() {
         {statusObj.status !== 'completed' && statusObj.status !== 'downloading' && statusObj.status !== 'fetching_info' && (
           <button 
             className="btn btn-primary" 
-            style={{ width: '100%', marginTop: '1rem', fontSize: '0.85rem', padding: '0.5rem' }}
+            style={{ 
+              width: '100%', 
+              marginTop: '1rem', 
+              fontSize: '0.85rem', 
+              padding: '0.5rem',
+              background: statusObj.status === 'interrupted' ? 'linear-gradient(135deg, #F59E0B, #D97706)' : undefined,
+              borderColor: statusObj.status === 'interrupted' ? '#D97706' : undefined
+            }}
             onClick={() => triggerModelDownload(activeRepo)}
           >
-            Download / Verify Model Cache
+            {statusObj.status === 'interrupted' 
+              ? `Resume Download (${Math.round(statusObj.progress)}% completed)` 
+              : 'Download / Verify Model Cache'}
           </button>
         )}
       </div>
