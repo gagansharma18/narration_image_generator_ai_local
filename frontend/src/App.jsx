@@ -58,46 +58,62 @@ export default function App() {
   const [fullImageModal, setFullImageModal] = useState(null);
   const [isDownloadingZip, setIsDownloadingZip] = useState(false);
   
-  const statusPollingRef = useRef(null);
-  const jobPollingRef = useRef(null);
+  const prevStatusRef = useRef('idle');
 
   // Load config on mount
   useEffect(() => {
     fetchConfig();
   }, []);
 
-  // Poll model status when step 1 is active or downloading
+  // Connect to SSE stream for real-time status updates (no more polling!)
   useEffect(() => {
-    const isDownloading = 
-      modelsStatus.text_model.status === 'downloading' || 
-      modelsStatus.text_model.status === 'fetching_info' ||
-      modelsStatus.image_model.status === 'downloading' || 
-      modelsStatus.image_model.status === 'fetching_info';
-      
-    if (activeStep === 1 || isDownloading) {
-      pollModelsStatus();
-      statusPollingRef.current = setInterval(pollModelsStatus, 2000);
-    } else {
-      if (statusPollingRef.current) clearInterval(statusPollingRef.current);
-    }
+    const textModel = customTextModel || config.selected_text_model;
+    const imageModel = customImageModel || config.selected_image_model;
+    
+    if (!textModel || !imageModel) return;
+    
+    const eventSource = new EventSource(`/api/stream?text_model=${encodeURIComponent(textModel)}&image_model=${encodeURIComponent(imageModel)}`);
+    
+    eventSource.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        
+        if (data.models) {
+          setModelsStatus(data.models);
+        }
+        
+        if (data.job) {
+          setJobStatus(data.job);
+          if (data.job.segments && data.job.segments.length > 0) {
+            setSegments(data.job.segments);
+          }
+          
+          // Handle transition notifications
+          const prevStatus = prevStatusRef.current;
+          const nextStatus = data.job.status;
+          
+          if (prevStatus === 'running' && nextStatus === 'completed') {
+            setActiveStep(4);
+            showNotification('Storyboard images generated successfully!', 'success');
+          } else if (prevStatus === 'running' && nextStatus === 'failed') {
+            showNotification(`Generation failed: ${data.job.error || 'Unknown error'}`, 'danger');
+          }
+          
+          prevStatusRef.current = nextStatus;
+        }
+      } catch (err) {
+        console.error('Error parsing SSE event:', err);
+      }
+    };
+    
+    eventSource.onerror = (err) => {
+      console.error('SSE connection error:', err);
+    };
     
     return () => {
-      if (statusPollingRef.current) clearInterval(statusPollingRef.current);
+      eventSource.close();
     };
-  }, [activeStep, config.selected_text_model, config.selected_image_model, modelsStatus.text_model.status, modelsStatus.image_model.status]);
-
-  // Poll generation job status when running
-  useEffect(() => {
-    if (jobStatus.status === 'running') {
-      jobPollingRef.current = setInterval(pollJobStatus, 1500);
-    } else {
-      if (jobPollingRef.current) clearInterval(jobPollingRef.current);
-    }
-    
-    return () => {
-      if (jobPollingRef.current) clearInterval(jobPollingRef.current);
-    };
-  }, [jobStatus.status]);
+  }, [config.selected_text_model, config.selected_image_model, customTextModel, customImageModel]);
 
   const showNotification = (message, type = 'info') => {
     setNotification({ message, type });
@@ -133,46 +149,9 @@ export default function App() {
         const data = await res.json();
         setConfig(data);
         showNotification('Config saved successfully.', 'success');
-        pollModelsStatus();
       }
     } catch (err) {
       showNotification('Failed to save configuration.', 'danger');
-    }
-  };
-
-  const pollModelsStatus = async () => {
-    const textModel = customTextModel || config.selected_text_model;
-    const imageModel = customImageModel || config.selected_image_model;
-    
-    try {
-      const res = await fetch(`/api/models/status?text_model=${encodeURIComponent(textModel)}&image_model=${encodeURIComponent(imageModel)}`);
-      if (res.ok) {
-        const data = await res.json();
-        setModelsStatus(data);
-      }
-    } catch (err) {
-      console.error('Error polling models status:', err);
-    }
-  };
-
-  const pollJobStatus = async () => {
-    try {
-      const res = await fetch('/api/jobs');
-      if (res.ok) {
-        const data = await res.json();
-        setJobStatus(data);
-        if (data.segments && data.segments.length > 0) {
-          setSegments(data.segments);
-        }
-        if (data.status === 'completed') {
-          setActiveStep(4);
-          showNotification('Storyboard images generated successfully!', 'success');
-        } else if (data.status === 'failed') {
-          showNotification(`Generation failed: ${data.error || 'Unknown error'}`, 'danger');
-        }
-      }
-    } catch (err) {
-      console.error('Error polling job status:', err);
     }
   };
 
@@ -184,7 +163,6 @@ export default function App() {
       });
       if (res.ok) {
         showNotification(`Downloading ${repoId} in background...`, 'info');
-        pollModelsStatus();
       } else {
         const errData = await res.json();
         showNotification(`Download trigger failed: ${errData.detail}`, 'danger');

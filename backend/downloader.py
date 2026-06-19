@@ -3,35 +3,39 @@ import time
 import os
 from pathlib import Path
 from huggingface_hub import HfApi, snapshot_download
+import huggingface_hub.utils.tqdm
 from backend.config import MODELS_CACHE_DIR, load_config
 import tqdm
 
 # Monkey-patch tqdm to safely track download progress without scanning files on Windows
 _original_update = tqdm.tqdm.update
 
-# Mappings from thread ID to repo ID and downloaded byte counts
-thread_active_repo = {}
-thread_downloaded_bytes = {}
+# Global trackers for active download repository and accumulated bytes
+active_download_repo = None
+downloaded_bytes_accumulator = 0
 download_status = {}
 
 def patched_update(self, n=1):
+    global downloaded_bytes_accumulator
     _original_update(self, n)
     try:
-        thread_id = threading.get_ident()
-        if thread_id in thread_downloaded_bytes:
-            thread_downloaded_bytes[thread_id] += n
-            repo_id = thread_active_repo.get(thread_id)
-            if repo_id and repo_id in download_status:
-                downloaded = thread_downloaded_bytes[thread_id]
-                total = download_status[repo_id]["total_size"]
-                if total > 0:
-                    progress = (downloaded / total) * 100
-                    download_status[repo_id]["progress"] = min(99.0, progress)
-                    download_status[repo_id]["downloaded"] = downloaded
-    except Exception:
-        pass
+        # Avoid crashing if n is None
+        if n is None:
+            n = 0
+        repo = active_download_repo
+        if repo and repo in download_status:
+            downloaded_bytes_accumulator += n
+            downloaded = downloaded_bytes_accumulator
+            total = download_status[repo]["total_size"]
+            if total > 0:
+                progress = (downloaded / total) * 100
+                download_status[repo]["progress"] = min(99.0, progress)
+                download_status[repo]["downloaded"] = downloaded
+    except Exception as e:
+        print(f"Exception in tqdm monkey-patch update: {e}")
 
 tqdm.tqdm.update = patched_update
+huggingface_hub.utils.tqdm.update = patched_update
 
 def get_repo_folder_name(repo_id: str) -> str:
     # huggingface_hub caches in hub/models--org--repo_name
@@ -54,15 +58,15 @@ def get_directory_size(path: Path) -> int:
     return total_size
 
 def download_worker(repo_id: str, hf_token: str):
-    thread_id = threading.get_ident()
-    thread_active_repo[thread_id] = repo_id
-    thread_downloaded_bytes[thread_id] = 0
+    global active_download_repo, downloaded_bytes_accumulator
+    active_download_repo = repo_id
+    downloaded_bytes_accumulator = 0
     try:
         download_status[repo_id]["status"] = "fetching_info"
         
         # Get repository files info to calculate total size
         api = HfApi()
-        model_info = api.model_info(repo_id, token=hf_token if hf_token else None)
+        model_info = api.model_info(repo_id, token=hf_token if hf_token else None, files_metadata=True)
         
         # Calculate total size of all files in repository
         total_size = sum(sibling.size for sibling in model_info.siblings if sibling.size is not None)
@@ -91,9 +95,9 @@ def download_worker(repo_id: str, hf_token: str):
         download_status[repo_id]["error"] = str(e)
         print(f"Error downloading {repo_id}: {e}")
     finally:
-        # Clean up thread variables
-        thread_active_repo.pop(thread_id, None)
-        thread_downloaded_bytes.pop(thread_id, None)
+        if active_download_repo == repo_id:
+            active_download_repo = None
+            downloaded_bytes_accumulator = 0
 
 def trigger_download(repo_id: str):
     config = load_config()

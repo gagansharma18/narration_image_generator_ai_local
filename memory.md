@@ -68,6 +68,10 @@ The goal is to build a local, web-based tool that:
   - `DreamShaper 8` `[Disk: 4.2 GB | VRAM: ~4.5 GB]`
   - `SDXL Turbo` `[Disk: 6.9 GB | VRAM: ~7.5 GB]`
 
+### C. Real-Time Status via Server-Sent Events (SSE)
+- **Problem**: Client-side interval polling (`setInterval`) for model downloads and image generation jobs was chatty, resource-intensive, and out-of-sync.
+- **Solution**: Replaced polling with standard Server-Sent Events (`SSE`). The backend in `main.py` exposes a single `/api/stream` endpoint returning a `StreamingResponse` (yielding JSON-serialized states). The React frontend binds to it using `EventSource`. This provides smooth, low-latency, real-time progress updates without client-side query loops.
+
 ---
 
 ## 5. Next Steps & Ideas for Enhancement

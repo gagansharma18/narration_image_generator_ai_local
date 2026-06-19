@@ -1,10 +1,12 @@
 import os
 import zipfile
+import json
+import asyncio
 from pathlib import Path
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 
@@ -85,6 +87,30 @@ def get_models_status(text_model: str, image_model: str):
         "text_model": text_status,
         "image_model": image_status
     }
+
+@app.get("/api/stream")
+async def stream_status(request: Request, text_model: str, image_model: str):
+    async def event_generator():
+        while True:
+            if await request.is_disconnected():
+                break
+            
+            # Fetch status
+            text_status = get_download_status(text_model)
+            image_status = get_download_status(image_model)
+            
+            payload = {
+                "models": {
+                    "text_model": text_status,
+                    "image_model": image_status
+                },
+                "job": generation_jobs
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+            await asyncio.sleep(1.0)
+            
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 @app.post("/api/models/download")
 def download_model(repo_id: str):
