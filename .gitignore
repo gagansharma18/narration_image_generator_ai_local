@@ -1,0 +1,24 @@
+# Models cache
+models_cache/
+
+# Generated outputs
+outputs/
+
+# Configurations (contains hf_token)
+config.json
+
+# Frontend node modules and build output
+frontend/node_modules/
+frontend/dist/
+
+# Python cache files
+__pycache__/
+backend/__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environment variables
+.env
+.venv/
+venv/
+env/

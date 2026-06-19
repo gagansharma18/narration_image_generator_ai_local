@@ -1,0 +1,8 @@
+{
+    "hf_token": "YOUR_HUGGING_FACE_TOKEN_HERE",
+    "selected_text_model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "selected_image_model": "stabilityai/sd-turbo",
+    "num_inference_steps": 1,
+    "guidance_scale": 0.0,
+    "use_gpu": false
+}
