@@ -49,6 +49,11 @@ class ConfigModel(BaseModel):
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None
     use_gpu: Optional[bool] = None
+    llm_provider: Optional[str] = None
+    ollama_url: Optional[str] = None
+    ollama_model: Optional[str] = None
+    openai_url: Optional[str] = None
+    openai_model: Optional[str] = None
 
 class ScriptInput(BaseModel):
     script_text: str
@@ -73,6 +78,36 @@ def update_config(config: ConfigModel):
     updated = save_config(config.model_dump(exclude_unset=True))
     add_log(f"System configuration updated: {config.model_dump(exclude_unset=True)}", "system")
     return updated
+
+@app.get("/api/ollama/models")
+def get_ollama_models(url: str):
+    import urllib.request
+    import json
+    endpoint = f"{url.rstrip('/')}/api/tags"
+    try:
+        req = urllib.request.Request(endpoint, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_data = response.read().decode("utf-8")
+            data = json.loads(res_data)
+            models = [m.get("name") for m in data.get("models", []) if m.get("name")]
+            return {"models": models}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch models from Ollama at '{endpoint}': {e}")
+
+@app.get("/api/openai/models")
+def get_openai_models(url: str):
+    import urllib.request
+    import json
+    endpoint = f"{url.rstrip('/')}/models"
+    try:
+        req = urllib.request.Request(endpoint, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res_data = response.read().decode("utf-8")
+            data = json.loads(res_data)
+            models = [m.get("id") for m in data.get("data", []) if m.get("id")]
+            return {"models": models}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch models from OpenAI API at '{endpoint}': {e}")
 
 @app.get("/api/script/sample")
 def get_sample_script():
@@ -158,6 +193,16 @@ def parse_script(input_data: ScriptInput):
     try:
         segments = process_script(input_data.script_text, input_data.custom_text_model)
         return {"segments": segments}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/script/cancel")
+def cancel_script_parse():
+    try:
+        from backend.llm_handler import cancel_script_parsing
+        cancel_script_parsing()
+        add_log("Cancellation request received for script parsing.", "system", "WARNING")
+        return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -1,10 +1,87 @@
 import re
 import torch
 import gc
+import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from backend.config import load_config
 
 from backend.logger import add_log
+
+class ScriptParsingCancelled(Exception):
+    pass
+
+import urllib.request
+import urllib.error
+
+def query_remote_llm(provider: str, config: dict, prompt: str) -> str:
+    """
+    Sends request to Ollama or LM Studio / OpenAI-compatible local servers.
+    """
+    if provider == "ollama":
+        base_url = config.get("ollama_url", "http://localhost:11434").rstrip("/")
+        url = f"{base_url}/api/generate"
+        model = config.get("ollama_model", "qwen2.5:3b")
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.2
+            }
+        }
+    else: # openai_compatible
+        base_url = config.get("openai_url", "http://localhost:1234/v1").rstrip("/")
+        url = f"{base_url}/chat/completions"
+        model = config.get("openai_model", "qwen2.5-3b-instruct")
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2
+        }
+
+    add_log(f"Sending prompt to remote LLM server ({provider.upper()}) at '{url}' using model '{model}'...", "llm")
+    
+    # Check cancellation before sending request
+    if _cancel_parse:
+        raise ScriptParsingCancelled("Script parsing cancelled by user.")
+        
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    
+    try:
+        # Using a timeout to prevent hanging requests
+        with urllib.request.urlopen(req, timeout=120) as response:
+            res_data = response.read().decode("utf-8")
+            res_json = json.loads(res_data)
+            
+            # Check cancellation right after receiving response
+            if _cancel_parse:
+                raise ScriptParsingCancelled("Script parsing cancelled by user.")
+                
+            if provider == "ollama":
+                return res_json.get("response", "").strip()
+            else: # openai_compatible
+                choices = res_json.get("choices", [])
+                if choices:
+                    return choices[0].get("message", {}).get("content", "").strip()
+                raise ValueError("No response choices found in OpenAI completions output.")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Failed to connect to local LLM server at '{url}': {e.reason}")
+    except Exception as e:
+        raise RuntimeError(f"Error communicating with local LLM server: {e}")
+
+_cancel_parse = False
+
+def cancel_script_parsing():
+    global _cancel_parse
+    _cancel_parse = True
 
 # Global variable to hold the loaded model and tokenizer to avoid reloading
 _loaded_model_id = None
@@ -65,158 +142,262 @@ def load_llm_model(model_id: str, hf_token: str = None):
     add_log(f"LLM model '{model_id}' loaded successfully on {device.upper()}.", "llm")
     return _tokenizer, _model
 
-def parse_script_timestamps(script_text: str):
+def split_script_into_sections(script_text: str) -> list:
     """
-    Parses a script and extracts lines with timestamps.
-    Supports formats like:
-    - 00:05 - Hello
-    - 0:10 Hello
-    - [0:15] Hello
-    - 5s - Hello
-    - 5 seconds: Hello
+    Partitions the script into logical sections separated by '========================================='
     """
-    lines = script_text.strip().split("\n")
-    parsed_segments = []
+    raw_blocks = script_text.split("=========================================")
+    sections = []
     
-    # Regular expressions for timestamps
-    # 1. Matches formats like 00:00, 0:00, [00:00], etc.
-    time_format_1 = re.compile(r'(?:\[)?(\d{1,2}:)?(\d{1,2}):(\d{2})(?:\])?')
-    # 2. Matches formats like 5s, 10s, 15 seconds, etc.
-    time_format_2 = re.compile(r'^(\d+)\s*(?:s|sec|second|seconds)\b')
+    # Filter empty blocks and strip whitespaces
+    blocks = [b.strip() for b in raw_blocks if b.strip()]
     
-    for i, line in enumerate(lines):
-        line = line.strip()
-        if not line:
-            continue
-            
-        timestamp = None
-        content = line
-        
-        # Try format 1
-        m1 = time_format_1.search(line)
-        if m1:
-            timestamp_str = m1.group(0)
-            # Remove brackets if present
-            timestamp = timestamp_str.replace("[", "").replace("]", "")
-            content = line.replace(timestamp_str, "").strip(" -:")
-        else:
-            # Try format 2
-            m2 = time_format_2.match(line)
-            if m2:
-                timestamp = f"{m2.group(1)}s"
-                content = line[m2.end():].strip(" -:")
-                
-        # If no timestamp found, make one up or treat as general script line
-        if not timestamp:
-            # Create a simple default timestamp (e.g., scene 1, scene 2) if it contains text
-            if len(content) > 3:
-                timestamp = f"Scene {len(parsed_segments) + 1}"
-                
-        if timestamp:
-            parsed_segments.append({
-                "id": len(parsed_segments),
-                "timestamp": timestamp,
-                "text": content,
-                "visual_prompt": "",
-                "status": "pending",
-                "image_url": None
+    i = 0
+    while i < len(blocks):
+        if i + 1 < len(blocks):
+            header = blocks[i]
+            content = blocks[i+1]
+            sections.append({
+                "header": header,
+                "content": content
             })
+            i += 2
+        else:
+            sections.append({
+                "header": "Section",
+                "content": blocks[i]
+            })
+            i += 1
             
-    return parsed_segments
+    # Fallback if no sections could be partitioned
+    if not sections:
+        sections.append({
+            "header": "Full Script",
+            "content": script_text
+        })
+        
+    return sections
 
-def generate_visual_prompt_for_line(script_line: str, tokenizer, model, model_id: str) -> str:
+def extract_json_array(text: str) -> list:
     """
-    Uses the local LLM to generate a visual scene description from a script line.
+    Extracts and parses a JSON array from LLM response.
     """
-    system_prompt = (
-        "You are an AI assistant that reads a line from a YouTube script and outputs a simple visual scene description. "
-        "The scene will be drawn in an amateur MS Paint stick-figure style. "
-        "Describe what objects and stick figures should be in the scene, where they are, and what action they are doing. "
-        "Keep the description brief and direct. Output ONLY the scene description. Do not write introductory words or conversational replies."
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+        
+    # Search for the boundaries of the JSON array '[' and ']'
+    start = text.find('[')
+    end = text.rfind(']')
+    if start != -1 and end != -1 and end > start:
+        json_str = text[start:end+1]
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+            
+    raise ValueError("No valid JSON array found in LLM output.")
+
+def fallback_regex_parser(script_text: str) -> list:
+    """
+    Smarter fallback parser:
+    - If timestamps are found, extracts scenes by matching lines with timestamps.
+    - If no timestamps are found, splits by paragraphs or non-empty sentences, and assigns Scene indices.
+    """
+    # First check if there are any timestamps in the script text
+    timestamp_pattern = re.compile(r'(\d{1,2}:\d{2}\s*[\u2013\u2014-]\s*\d{1,2}:\d{2})|(\d{1,2}:\d{2})')
+    has_timestamps = any(timestamp_pattern.search(line) for line in script_text.split("\n"))
+    
+    segments = []
+    
+    if has_timestamps:
+        # Timestamp-based extraction
+        lines = script_text.split("\n")
+        for line in lines:
+            line = line.strip()
+            if not line or line.lower().startswith("[visuals:") or line.startswith("===") or line.startswith("]"):
+                continue
+                
+            m = timestamp_pattern.search(line)
+            if m:
+                timestamp = m.group(0)
+                content = line.replace(timestamp, "")
+                content = content.replace("**", "").replace("*", "").strip(" -:*[]\u2013\u2014")
+                if content:
+                    segments.append({
+                        "timestamp": timestamp,
+                        "text": content,
+                        "visual_prompt": content
+                    })
+    else:
+        # Paragraph or sentence-based extraction for plain scripts
+        raw_lines = script_text.split("\n")
+        scene_num = 1
+        for line in raw_lines:
+            line = line.strip()
+            # Ignore separators or formatting lines
+            if not line or line.startswith("===") or line.lower().startswith("[visuals:") or line.startswith("]"):
+                continue
+                
+            # If line is longer than 15 characters, treat it as a scene
+            if len(line) > 15:
+                content = line.replace("**", "").replace("*", "").strip(" -:*[]\u2013\u2014")
+                segments.append({
+                    "timestamp": f"Scene {scene_num}",
+                    "text": content,
+                    "visual_prompt": content
+                })
+                scene_num += 1
+                
+    return segments
+
+def get_llm_analysis_prompt(system_prompt_template: str, header: str, content: str) -> str:
+    """
+    Assembles the detailed LLM prompt by putting script content inside system_prompt.md instructions.
+    """
+    prompt = system_prompt_template
+    
+    section_text = f"Section: {header}\n\n{content}"
+    if "{PASTE SCRIPT HERE}" in prompt:
+        prompt = prompt.replace("{PASTE SCRIPT HERE}", section_text)
+    else:
+        prompt = f"{prompt}\n\n### Script Section to Process:\n{section_text}"
+        
+    json_instructions = (
+        "\n\n### IMPORTANT INSTRUCTIONS FOR YOUR RESPONSE:\n"
+        "Analyze the script section above and identify every scene that requires a separate image.\n"
+        "For each scene, extract the timestamp and narrator line/visual action, and write a specific visual scene description.\n"
+        "Output the final list of scenes as a valid JSON array of objects. Each object MUST contain these exact fields:\n"
+        '  - "timestamp": the timestamp of the scene (e.g. "0:00 - 0:04")\n'
+        '  - "text": a short description of the action or narrator dialogue at that moment\n'
+        '  - "visual_prompt": a description of the visual scene to be drawn (e.g. "a prehistoric human shivering in a dark cave corner"). Do not include any style or format prefixes like "MS Paint" or "A 16:9 frame" in this field; only specify the specific characters, actions, and objects.\n\n'
+        "Format the output strictly as a JSON array starting with '[' and ending with ']'. "
+        "Do not include any conversational text, markdown wrapping (such as ```json ... ```), or HTML tags. Your output must be parseable by python's json.loads()."
     )
     
-    user_prompt = f"Script line: \"{script_line}\"\n\nScene description:"
-    
-    # Try using the standard chat template if available, fallback otherwise
-    try:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    except Exception:
-        if "TinyLlama" in model_id:
-            text = f"<|system|>\n{system_prompt}</s>\n<|user|>\n{user_prompt}</s>\n<|assistant|>\n"
-        else:
-            text = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
-        
-    inputs = tokenizer([text], return_tensors="pt")
-    
-    # Place inputs on the model's device
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
-    
-    # Set pad token ID if it is not set (llama and others sometimes lack one)
-    pad_token = tokenizer.pad_token_id or tokenizer.eos_token_id
-    
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=60,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-            pad_token_id=pad_token
-        )
-        
-    generated_ids = [
-        output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs["input_ids"], generated_ids)
-    ]
-    
-    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-    
-    # Strip any extra quotes
-    response = response.strip('"\'')
-    return response
+    return f"{prompt}{json_instructions}"
 
 def process_script(script_text: str, custom_model_id: str = None) -> list:
     """
-    Parses the script and fills in the visual prompts using the local LLM.
+    Parses the script using system_prompt.md rules and extracts all scenes with timestamps and visual prompts.
     """
+    global _cancel_parse
+    _cancel_parse = False
     config = load_config()
-    model_id = custom_model_id or config.get("selected_text_model", "Qwen/Qwen2.5-0.5B-Instruct")
-    hf_token = config.get("hf_token", "")
+    llm_provider = config.get("llm_provider", "local")
     
-    add_log(f"Received script text ({len(script_text)} characters). Parsing scene segments...", "llm")
-    segments = parse_script_timestamps(script_text)
-    if not segments:
-        add_log("No scene segments or timestamps could be parsed from the script text.", "llm", "WARNING")
-        return []
-        
-    add_log(f"Parsed {len(segments)} scene segments. Loading text model '{model_id}'...", "llm")
+    add_log(f"Received script text ({len(script_text)} characters). Splitting into sections...", "llm")
+    sections = split_script_into_sections(script_text)
+    add_log(f"Partitioned script into {len(sections)} sections for granular LLM extraction.", "llm")
+    
+    # Load system prompt template from system_prompt.md
+    system_prompt_template = ""
     try:
-        tokenizer, model = load_llm_model(model_id, hf_token)
-        add_log("Text model is loaded. Generating scene descriptions...", "llm")
-        
-        for segment in segments:
-            text = segment["text"]
-            if text:
-                add_log(f"Running LLM inference for Scene {segment['id']} ({segment['timestamp']}): '{text[:40]}...'", "llm")
-                visual_prompt = generate_visual_prompt_for_line(text, tokenizer, model, model_id)
-                segment["visual_prompt"] = visual_prompt
-                add_log(f"Generated Visual Prompt: '{visual_prompt[:60]}...'", "llm")
-            else:
-                segment["visual_prompt"] = "A blank white screen."
-                add_log(f"Scene {segment['id']} ({segment['timestamp']}) has no text; using default prompt.", "llm")
-                
-        add_log("Finished visual prompt generation for all scene segments successfully.", "llm")
+        from backend.config import WORKSPACE_DIR
+        system_prompt_path = WORKSPACE_DIR / "system_prompt.md"
+        if system_prompt_path.exists():
+            with open(system_prompt_path, "r", encoding="utf-8") as f:
+                system_prompt_template = f.read()
     except Exception as e:
-        add_log(f"Error running local LLM: {e}. Falling back to default script line text as prompt.", "llm", "ERROR")
-        # Fallback to simple description if model loading/generation fails
-        for segment in segments:
-            segment["visual_prompt"] = segment["text"]
+        add_log(f"Error reading system_prompt.md: {e}", "llm", "WARNING")
+        
+    if not system_prompt_template:
+        system_prompt_template = (
+            "You are an AI assistant that extracts visual scene descriptions from a YouTube script. "
+            "For each timestamp, generate a clean visual scene description."
+        )
+        
+    all_scenes = []
+    
+    try:
+        if llm_provider == "local":
+            model_id = custom_model_id or config.get("selected_text_model", "Qwen/Qwen2.5-0.5B-Instruct")
+            hf_token = config.get("hf_token", "")
+            add_log(f"Loading text model '{model_id}' to run full script analysis...", "llm")
+            tokenizer, model = load_llm_model(model_id, hf_token)
+            add_log("Text model loaded successfully. Starting section analysis...", "llm")
+        else:
+            add_log(f"Starting remote section analysis using {llm_provider.upper()} provider...", "llm")
             
-    return segments
+        for section in sections:
+            if _cancel_parse:
+                raise ScriptParsingCancelled("Script parsing cancelled by user.")
+            header = section["header"]
+            content = section["content"]
+            
+            # Construct the prompt
+            full_prompt = get_llm_analysis_prompt(system_prompt_template, header, content)
+            
+            # Run inference
+            if llm_provider == "local":
+                try:
+                    messages = [
+                        {"role": "user", "content": full_prompt}
+                    ]
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True
+                    )
+                except Exception:
+                    text = f"User: {full_prompt}\n\nAssistant:"
+                    
+                inputs = tokenizer([text], return_tensors="pt")
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+                pad_token = tokenizer.pad_token_id or tokenizer.eos_token_id
+                
+                add_log(f"Running LLM analysis for Section: '{header}'...", "llm")
+                
+                with torch.no_grad():
+                    generated_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=1500,
+                        do_sample=True,
+                        temperature=0.2,
+                        top_p=0.9,
+                        pad_token_id=pad_token
+                    )
+                    
+                generated_ids = [
+                    output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs["input_ids"], generated_ids)
+                ]
+                
+                response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+            else:
+                response = query_remote_llm(llm_provider, config, full_prompt)
+            
+            # Parse JSON
+            try:
+                scenes = extract_json_array(response)
+                add_log(f"Successfully extracted {len(scenes)} scenes from section '{header}'.", "llm")
+                all_scenes.extend(scenes)
+            except Exception as e:
+                add_log(f"Failed to parse LLM JSON for section '{header}': {e}. Falling back to regex parser.", "llm", "WARNING")
+                fallback_scenes = fallback_regex_parser(content)
+                add_log(f"Regex parser extracted {len(fallback_scenes)} scenes from section '{header}'.", "llm")
+                all_scenes.extend(fallback_scenes)
+                
+    except ScriptParsingCancelled as e:
+        add_log("Script parsing cancelled by user request.", "llm", "WARNING")
+        raise e
+    except Exception as e:
+        add_log(f"Error running local LLM: {e}. Falling back to pure regex parser for the entire script.", "llm", "ERROR")
+        # Run fallback regex parser on the entire script
+        all_scenes = fallback_regex_parser(script_text)
+        
+    # Process final segments
+    final_segments = []
+    for idx, scene in enumerate(all_scenes):
+        final_segments.append({
+            "id": idx,
+            "timestamp": scene.get("timestamp", f"Scene {idx+1}"),
+            "text": scene.get("text", "No narration line."),
+            "visual_prompt": scene.get("visual_prompt", "No prompt description."),
+            "status": "pending",
+            "image_url": None
+        })
+        
+    add_log(f"Completed analysis. Extracted total {len(final_segments)} scenes for storyboard rendering.", "llm")
+    return final_segments

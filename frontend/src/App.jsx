@@ -20,6 +20,23 @@ import {
   ChevronUp
 } from 'lucide-react';
 
+const DEFAULT_TEXT_MODELS = [
+  { id: 'Qwen/Qwen2.5-0.5B-Instruct', label: 'Qwen 2.5 0.5B Instruct [Disk: 0.9 GB | VRAM: ~1.5 GB]' },
+  { id: 'meta-llama/Llama-3.2-1B-Instruct', label: 'Llama 3.2 1B Instruct [Disk: 2.2 GB | VRAM: ~2.5 GB] (Gated)' },
+  { id: 'TinyLlama/TinyLlama-1.1B-Chat-v1.0', label: 'TinyLlama 1.1B Chat [Disk: 2.2 GB | VRAM: ~2.5 GB]' },
+  { id: 'Qwen/Qwen2.5-1.5B-Instruct', label: 'Qwen 2.5 1.5B Instruct [Disk: 2.8 GB | VRAM: ~3.5 GB]' },
+  { id: 'Qwen/Qwen2.5-3B-Instruct', label: 'Qwen 2.5 3B Instruct [Disk: 5.8 GB | VRAM: ~6.5 GB]' },
+  { id: 'Qwen/Qwen3-4B-Instruct', label: 'Qwen 3 4B Instruct [Disk: 7.9 GB | VRAM: ~8.5 GB]' },
+  { id: 'meta-llama/Llama-3.2-3B-Instruct', label: 'Llama 3.2 3B Instruct [Disk: 6.2 GB | VRAM: ~7.0 GB] (Gated)' }
+];
+
+const DEFAULT_IMAGE_MODELS = [
+  { id: 'stabilityai/sd-turbo', label: 'SD Turbo (Fastest 1-step) [Disk: 2.0 GB | VRAM: ~3.0 GB]' },
+  { id: 'runwayml/stable-diffusion-v1-5', label: 'Stable Diffusion v1.5 [Disk: 4.2 GB | VRAM: ~4.5 GB]' },
+  { id: 'Lykon/dreamshaper-8', label: 'DreamShaper 8 (Stylized SD1.5) [Disk: 4.2 GB | VRAM: ~4.5 GB]' },
+  { id: 'stabilityai/sdxl-turbo', label: 'SDXL Turbo (High Quality 1-step) [Disk: 6.9 GB | VRAM: ~7.5 GB]' }
+];
+
 export default function App() {
   // Configurations State
   const [config, setConfig] = useState({
@@ -28,7 +45,12 @@ export default function App() {
     selected_image_model: 'stabilityai/sd-turbo',
     num_inference_steps: 1,
     guidance_scale: 0.0,
-    use_gpu: false
+    use_gpu: false,
+    llm_provider: 'local',
+    ollama_url: 'http://localhost:11434',
+    ollama_model: 'qwen2.5:3b',
+    openai_url: 'http://localhost:1234/v1',
+    openai_model: 'qwen2.5-3b-instruct'
   });
   
   // Custom inputs for model IDs
@@ -61,6 +83,11 @@ export default function App() {
   const [notification, setNotification] = useState(null);
   const [fullImageModal, setFullImageModal] = useState(null);
   const [isDownloadingZip, setIsDownloadingZip] = useState(false);
+  
+  // Remote models states
+  const [remoteModels, setRemoteModels] = useState([]);
+  const [isFetchingRemoteModels, setIsFetchingRemoteModels] = useState(false);
+  const [remoteModelsError, setRemoteModelsError] = useState(null);
   
   // System Logs States
   const [logs, setLogs] = useState([]);
@@ -153,17 +180,74 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setConfig(data);
-        if (data.selected_text_model && !['Qwen/Qwen2.5-0.5B-Instruct', 'Qwen/Qwen2.5-1.5B-Instruct', 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'].includes(data.selected_text_model)) {
-          setCustomTextModel(data.selected_text_model);
+        if (data.selected_text_model) {
+          const isDefaultText = DEFAULT_TEXT_MODELS.some(m => m.id === data.selected_text_model);
+          setCustomTextModel(isDefaultText ? '' : data.selected_text_model);
         }
-        if (data.selected_image_model && !['stabilityai/sd-turbo', 'runwayml/stable-diffusion-v1-5', 'Lykon/dreamshaper-8'].includes(data.selected_image_model)) {
-          setCustomImageModel(data.selected_image_model);
+        if (data.selected_image_model) {
+          const isDefaultImage = DEFAULT_IMAGE_MODELS.some(m => m.id === data.selected_image_model);
+          setCustomImageModel(isDefaultImage ? '' : data.selected_image_model);
         }
       }
     } catch (err) {
       showNotification('Failed to load config file.', 'danger');
     }
   };
+
+  const fetchRemoteModels = async (provider, url) => {
+    if (!url) return;
+    setIsFetchingRemoteModels(true);
+    setRemoteModelsError(null);
+    try {
+      const endpoint = provider === 'ollama' 
+        ? `/api/ollama/models?url=${encodeURIComponent(url)}` 
+        : `/api/openai/models?url=${encodeURIComponent(url)}`;
+      const res = await fetch(endpoint);
+      if (res.ok) {
+        const data = await res.json();
+        setRemoteModels(data.models || []);
+      } else {
+        const err = await res.json();
+        setRemoteModelsError(err.detail || 'Could not reach server');
+        setRemoteModels([]);
+      }
+    } catch (e) {
+      setRemoteModelsError('Could not reach local server');
+      setRemoteModels([]);
+    } finally {
+      setIsFetchingRemoteModels(false);
+    }
+  };
+
+  useEffect(() => {
+    if (config.llm_provider === 'ollama') {
+      fetchRemoteModels('ollama', config.ollama_url);
+    } else if (config.llm_provider === 'openai_compatible') {
+      fetchRemoteModels('openai_compatible', config.openai_url);
+    } else {
+      setRemoteModels([]);
+      setRemoteModelsError(null);
+    }
+  }, [config.llm_provider, config.ollama_url, config.openai_url]);
+
+  // Auto-select remote model when remoteModels list is loaded
+  useEffect(() => {
+    if (remoteModels.length > 0) {
+      if (config.llm_provider === 'ollama') {
+        if (!remoteModels.includes(config.ollama_model)) {
+          const firstModel = remoteModels[0];
+          setConfig(prev => ({ ...prev, ollama_model: firstModel }));
+          handleSaveConfig({ ...config, ollama_model: firstModel });
+        }
+      } else if (config.llm_provider === 'openai_compatible') {
+        if (!remoteModels.includes(config.openai_model)) {
+          const firstModel = remoteModels[0];
+          setConfig(prev => ({ ...prev, openai_model: firstModel }));
+          handleSaveConfig({ ...config, openai_model: firstModel });
+        }
+      }
+    }
+  }, [remoteModels, config.llm_provider]);
 
   const fetchLogs = async () => {
     try {
@@ -204,6 +288,14 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setConfig(data);
+        if (data.selected_text_model) {
+          const isDefaultText = DEFAULT_TEXT_MODELS.some(m => m.id === data.selected_text_model);
+          setCustomTextModel(isDefaultText ? '' : data.selected_text_model);
+        }
+        if (data.selected_image_model) {
+          const isDefaultImage = DEFAULT_IMAGE_MODELS.some(m => m.id === data.selected_image_model);
+          setCustomImageModel(isDefaultImage ? '' : data.selected_image_model);
+        }
         showNotification('Config saved successfully.', 'success');
       }
     } catch (err) {
@@ -395,8 +487,58 @@ export default function App() {
     }
   };
 
+  const renderRemoteModelSelector = (provider, url, selectedModel, onSelect) => {
+    const isModelInList = remoteModels.includes(selectedModel);
+    const dropdownVal = isModelInList ? selectedModel : '';
+    
+    return (
+      <div className="form-group" style={{ margin: 0 }}>
+        <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>Model Name</span>
+          {isFetchingRemoteModels && <span style={{ fontSize: '0.75rem', color: 'var(--accent)' }}>Fetching...</span>}
+        </label>
+        
+        {isFetchingRemoteModels ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.5rem', background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+            <Loader size={14} className="spinner text-accent" />
+            <span>Scanning server for models...</span>
+          </div>
+        ) : remoteModels.length > 0 ? (
+          <select
+            className="text-input"
+            value={dropdownVal}
+            onChange={(e) => onSelect(e.target.value)}
+          >
+            <option value="" disabled>-- Select a Model --</option>
+            {remoteModels.map(m => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+          </select>
+        ) : (
+          <div style={{ padding: '0.75rem', background: 'rgba(239, 68, 68, 0.05)', border: '1px solid rgba(239, 68, 68, 0.2)', borderRadius: 'var(--radius-sm)', display: 'flex', flexDirection: 'column', gap: '0.5rem', marginTop: '0.25rem' }}>
+            <div style={{ display: 'flex', gap: '0.35rem', color: 'var(--danger)', fontSize: '0.8rem', alignItems: 'center' }}>
+              <AlertCircle size={14} style={{ flexShrink: 0 }} />
+              <span style={{ fontWeight: 500 }}>Connection Failed: Server Offline</span>
+            </div>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', margin: 0, lineHeight: '1.3' }}>
+              Could not connect to {provider === 'ollama' ? 'Ollama' : 'LM Studio'} at <code>{url}</code>. Please check if your server is running.
+            </p>
+            <button 
+              type="button" 
+              className="btn btn-secondary" 
+              style={{ fontSize: '0.75rem', padding: '0.25rem 0.5rem', alignSelf: 'flex-start', marginTop: '0.25rem' }} 
+              onClick={() => fetchRemoteModels(provider, url)}
+            >
+              Retry Connection
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const renderModelDownloader = (type, displayName, defaultModels, selectedVal, setSelectedVal, customVal, setCustomVal, statusObj) => {
-    const isCustom = selectedVal === 'custom';
+    const isCustom = selectedVal === 'custom' || (selectedVal && !defaultModels.some(m => m.id === selectedVal));
     const activeRepo = isCustom ? customVal : selectedVal;
     
     return (
@@ -417,6 +559,7 @@ export default function App() {
                 setSelectedVal('custom');
               } else {
                 setSelectedVal(val);
+                setCustomVal('');
                 handleSaveConfig({ 
                   ...config, 
                   [type === 'text' ? 'selected_text_model' : 'selected_image_model']: val,
@@ -507,9 +650,27 @@ export default function App() {
         )}
 
         {statusObj.error && (
-          <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.35rem', color: 'var(--danger)', fontSize: '0.8rem', alignItems: 'flex-start' }}>
-            <AlertCircle size={14} style={{ flexShrink: 0, marginTop: '2px' }} />
-            <span>{statusObj.error}</span>
+          <div style={{ marginTop: '0.75rem' }}>
+            <div style={{ display: 'flex', gap: '0.35rem', color: 'var(--danger)', fontSize: '0.8rem', alignItems: 'flex-start' }}>
+              <AlertCircle size={14} style={{ flexShrink: 0, marginTop: '2px' }} />
+              <span>{statusObj.error}</span>
+            </div>
+            {statusObj.error.toLowerCase().includes('gated') && (
+              <div style={{
+                marginTop: '0.5rem',
+                padding: '0.5rem',
+                background: 'rgba(245, 158, 11, 0.1)',
+                border: '1px solid rgba(245, 158, 11, 0.2)',
+                borderRadius: '4px',
+                fontSize: '0.75rem',
+                color: '#F59E0B'
+              }}>
+                <strong>Gated Model Access Required:</strong> Make sure you have accepted the license terms on Hugging Face at 
+                <a href={`https://huggingface.co/${activeRepo}`} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)', marginLeft: '4px', textDecoration: 'underline' }}>
+                  {activeRepo}
+                </a>, and pasted your HF Token in the Configuration panel above.
+              </div>
+            )}
           </div>
         )}
 
@@ -727,36 +888,11 @@ export default function App() {
           <div className="glass-panel">
             <h2 style={{ fontSize: '1.25rem', marginBottom: '1.25rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <Settings size={18} className="text-primary" />
-              HF Configurations
+              Inference settings
             </h2>
             
-            <div className="form-group">
-              <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span>Hugging Face User Token</span>
-                <a 
-                  href="https://huggingface.co/settings/tokens" 
-                  target="_blank" 
-                  rel="noopener noreferrer"
-                  style={{ color: 'var(--accent)', fontSize: '0.75rem', textDecoration: 'none', fontWeight: 600 }}
-                >
-                  Get Token ↗
-                </a>
-              </label>
-              <input 
-                type="password" 
-                className="text-input" 
-                placeholder="Paste token (hf_...)" 
-                value={config.hf_token}
-                onChange={(e) => setConfig(prev => ({ ...prev, hf_token: e.target.value }))}
-                onBlur={() => handleSaveConfig()}
-              />
-              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem', display: 'block' }}>
-                Required to download gated or customized models.
-              </span>
-            </div>
-            
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
-              <div className="form-group">
+              <div className="form-group" style={{ margin: 0 }}>
                 <label className="form-label">Inference Steps</label>
                 <input 
                   type="number" 
@@ -771,7 +907,7 @@ export default function App() {
                   max="100"
                 />
               </div>
-              <div className="form-group">
+              <div className="form-group" style={{ margin: 0 }}>
                 <label className="form-label">Guidance Scale</label>
                 <input 
                   type="number" 
@@ -790,95 +926,248 @@ export default function App() {
             </div>
           </div>
 
-          {/* Text Causal LLM Downloader */}
-          {renderModelDownloader(
-            'text',
-            'Text Generation LLM',
-            [
-              { id: 'Qwen/Qwen2.5-0.5B-Instruct', label: 'Qwen 2.5 0.5B Instruct [Disk: 0.9 GB | VRAM: ~1.5 GB]' },
-              { id: 'meta-llama/Llama-3.2-1B-Instruct', label: 'Llama 3.2 1B Instruct [Disk: 2.2 GB | VRAM: ~2.5 GB]' },
-              { id: 'TinyLlama/TinyLlama-1.1B-Chat-v1.0', label: 'TinyLlama 1.1B Chat [Disk: 2.2 GB | VRAM: ~2.5 GB]' },
-              { id: 'Qwen/Qwen2.5-1.5B-Instruct', label: 'Qwen 2.5 1.5B Instruct [Disk: 2.8 GB | VRAM: ~3.5 GB]' },
-              { id: 'google/gemma-2-2b-it', label: 'Gemma 2 2B Instruct [Disk: 5.4 GB | VRAM: ~6.0 GB] (Gated)' },
-              { id: 'Qwen/Qwen2.5-3B-Instruct', label: 'Qwen 2.5 3B Instruct [Disk: 5.8 GB | VRAM: ~6.5 GB]' },
-              { id: 'meta-llama/Llama-3.2-3B-Instruct', label: 'Llama 3.2 3B Instruct [Disk: 6.2 GB | VRAM: ~7.0 GB]' }
-            ],
-            config.selected_text_model,
-            (val) => setConfig(prev => ({ ...prev, selected_text_model: val })),
-            customTextModel,
-            setCustomTextModel,
-            modelsStatus.text_model
-          )}
+          {/* Active Engine Status Panel (Read-only summary) */}
+          <div className="glass-panel" style={{ marginTop: '1rem' }}>
+            <h3 style={{ fontSize: '1.05rem', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.5rem' }}>
+              <FileText size={16} className="text-accent" />
+              Active Configuration
+            </h3>
+            
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', fontSize: '0.85rem' }}>
+              <div>
+                <span style={{ color: 'var(--text-secondary)', display: 'block', marginBottom: '0.15rem' }}>LLM Service Provider:</span>
+                <span className="badge badge-info" style={{ fontWeight: 600 }}>
+                  {config.llm_provider === 'local' ? 'Local Model (Hugging Face)' : config.llm_provider === 'ollama' ? 'Ollama API' : 'LM Studio / OpenAI API'}
+                </span>
+              </div>
+              
+              <div>
+                <span style={{ color: 'var(--text-secondary)', display: 'block', marginBottom: '0.15rem' }}>Active Text Model:</span>
+                <span style={{ fontFamily: 'monospace', color: 'var(--text-primary)', wordBreak: 'break-all' }}>
+                  {config.llm_provider === 'local' 
+                    ? (config.selected_text_model || 'None')
+                    : config.llm_provider === 'ollama' 
+                      ? (config.ollama_model || 'None')
+                      : (config.openai_model || 'None')}
+                </span>
+              </div>
 
-          {/* Image Gen Downloader */}
-          {renderModelDownloader(
-            'image',
-            'Image Generation Model',
-            [
-              { id: 'stabilityai/sd-turbo', label: 'SD Turbo (Fastest 1-step) [Disk: 2.0 GB | VRAM: ~3.0 GB]' },
-              { id: 'runwayml/stable-diffusion-v1-5', label: 'Stable Diffusion v1.5 [Disk: 4.2 GB | VRAM: ~4.5 GB]' },
-              { id: 'Lykon/dreamshaper-8', label: 'DreamShaper 8 (Stylized SD1.5) [Disk: 4.2 GB | VRAM: ~4.5 GB]' },
-              { id: 'stabilityai/sdxl-turbo', label: 'SDXL Turbo (High Quality 1-step) [Disk: 6.9 GB | VRAM: ~7.5 GB]' }
-            ],
-            config.selected_image_model,
-            (val) => setConfig(prev => ({ ...prev, selected_image_model: val })),
-            customImageModel,
-            setCustomImageModel,
-            modelsStatus.image_model
-          )}
+              <div style={{ borderTop: '1px dashed var(--border)', paddingTop: '0.75rem' }}>
+                <span style={{ color: 'var(--text-secondary)', display: 'block', marginBottom: '0.15rem' }}>Active Image Model:</span>
+                <span style={{ fontFamily: 'monospace', color: 'var(--text-primary)', display: 'block', marginBottom: '0.25rem', wordBreak: 'break-all' }}>
+                  {config.selected_image_model || 'None'}
+                </span>
+                <span style={{ fontSize: '0.75rem', display: 'inline-flex', alignItems: 'center' }}>
+                  Status: &nbsp;{getStatusBadge(modelsStatus.image_model.status)}
+                </span>
+              </div>
+            </div>
+          </div>
         </aside>
 
         {/* RIGHT COLUMN: WORKSPACE STEPS */}
         <main className="glass-panel highlight-border" style={{ minHeight: '600px' }}>
-          
-          {/* STEP 1: DOWNLOAD MODELS PANEL */}
-          {activeStep === 1 && (
-            <div style={{ textAlign: 'center', padding: '3rem 1.5rem' }}>
-              <div style={{
-                background: 'rgba(99, 102, 241, 0.1)',
-                width: '80px',
-                height: '80px',
-                borderRadius: '50%',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                margin: '0 auto 1.5rem',
-                border: '1px solid rgba(99, 102, 241, 0.2)'
-              }}>
-                <Download size={40} className="text-primary" />
+                   {/* STEP 1: CONFIGURE & VERIFY MODELS */}
+          {activeStep === 1 && (() => {
+            const isImageModelReady = modelsStatus.image_model.status === 'completed';
+            const isTextModelReady = config.llm_provider === 'local' 
+              ? modelsStatus.text_model.status === 'completed'
+              : config.llm_provider === 'ollama'
+                ? (config.ollama_model && remoteModels.includes(config.ollama_model))
+                : (config.openai_model && remoteModels.includes(config.openai_model));
+            const canProceed = isImageModelReady && isTextModelReady;
+
+            return (
+              <div>
+                <h2 style={{ fontSize: '1.4rem', marginBottom: '0.5rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <Settings size={20} className="text-primary" />
+                  Model Configuration & Setup
+                </h2>
+                <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginBottom: '1.5rem' }}>
+                  Set up the Text LLM for parsing scripts and the local Image model for storyboard rendering.
+                </p>
+
+                <div className="setup-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1.5rem', marginBottom: '2rem' }}>
+                  {/* Text Generation Panel */}
+                  <div className="glass-panel" style={{ background: 'rgba(255,255,255,0.01)', border: '1px solid var(--border)', padding: '1.25rem' }}>
+                    <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.5rem' }}>
+                      <FileText size={18} className="text-accent" />
+                      1. Text Generation LLM
+                    </h3>
+
+                    <div className="form-group" style={{ marginBottom: '1rem' }}>
+                      <label className="form-label">LLM Service Provider</label>
+                      <select 
+                        className="text-input" 
+                        value={config.llm_provider || 'local'}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setConfig(prev => ({ ...prev, llm_provider: val }));
+                          handleSaveConfig({ ...config, llm_provider: val });
+                        }}
+                      >
+                        <option value="local">Local Model (Hugging Face Download)</option>
+                        <option value="ollama">Ollama (Local Server API)</option>
+                        <option value="openai_compatible">LM Studio / OpenAI Compatible API</option>
+                      </select>
+                    </div>
+
+                    {config.llm_provider === 'local' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                        <div className="form-group" style={{ margin: 0 }}>
+                          <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <span>Hugging Face Token</span>
+                            <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)', fontSize: '0.75rem', textDecoration: 'none' }}>
+                              Get Token ↗
+                            </a>
+                          </label>
+                          <input 
+                            type="password" 
+                            className="text-input" 
+                            placeholder="Paste hf_token if needed..." 
+                            value={config.hf_token}
+                            onChange={(e) => setConfig(prev => ({ ...prev, hf_token: e.target.value }))}
+                            onBlur={() => handleSaveConfig()}
+                          />
+                        </div>
+                        
+                        <div style={{ borderTop: '1px dashed var(--border)', paddingTop: '1rem' }}>
+                          {renderModelDownloader(
+                            'text',
+                            'Text LLM Downloader',
+                            DEFAULT_TEXT_MODELS,
+                            config.selected_text_model,
+                            (val) => setConfig(prev => ({ ...prev, selected_text_model: val })),
+                            customTextModel,
+                            setCustomTextModel,
+                            modelsStatus.text_model
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {config.llm_provider === 'ollama' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                        <div className="form-group" style={{ margin: 0 }}>
+                          <label className="form-label">Ollama API URL</label>
+                          <input 
+                            type="text" 
+                            className="text-input" 
+                            placeholder="e.g. http://localhost:11434" 
+                            value={config.ollama_url || ''}
+                            onChange={(e) => setConfig(prev => ({ ...prev, ollama_url: e.target.value }))}
+                            onBlur={() => handleSaveConfig()}
+                          />
+                        </div>
+
+                        {renderRemoteModelSelector(
+                          'ollama',
+                          config.ollama_url,
+                          config.ollama_model,
+                          (val) => {
+                            setConfig(prev => ({ ...prev, ollama_model: val }));
+                            handleSaveConfig({ ...config, ollama_model: val });
+                          }
+                        )}
+                      </div>
+                    )}
+
+                    {config.llm_provider === 'openai_compatible' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                        <div className="form-group" style={{ margin: 0 }}>
+                          <label className="form-label">API Base URL</label>
+                          <input 
+                            type="text" 
+                            className="text-input" 
+                            placeholder="e.g. http://localhost:1234/v1" 
+                            value={config.openai_url || ''}
+                            onChange={(e) => setConfig(prev => ({ ...prev, openai_url: e.target.value }))}
+                            onBlur={() => handleSaveConfig()}
+                          />
+                        </div>
+
+                        {renderRemoteModelSelector(
+                          'openai_compatible',
+                          config.openai_url,
+                          config.openai_model,
+                          (val) => {
+                            setConfig(prev => ({ ...prev, openai_model: val }));
+                            handleSaveConfig({ ...config, openai_model: val });
+                          }
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Image Generation Panel */}
+                  <div className="glass-panel" style={{ background: 'rgba(255,255,255,0.01)', border: '1px solid var(--border)', padding: '1.25rem' }}>
+                    <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', display: 'flex', alignItems: 'center', gap: '0.5rem', borderBottom: '1px solid var(--border)', paddingBottom: '0.5rem' }}>
+                      <ImageIcon size={18} className="text-accent" />
+                      2. Image Generation Model
+                    </h3>
+                    
+                    <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '1rem', lineHeight: '1.4' }}>
+                      Storyboard images are always generated locally on your machine using local hardware acceleration or CPU.
+                    </p>
+
+                    <div style={{ borderTop: '1px dashed var(--border)', paddingTop: '1rem' }}>
+                      {renderModelDownloader(
+                        'image',
+                        'Image Model Downloader',
+                        DEFAULT_IMAGE_MODELS,
+                        config.selected_image_model,
+                        (val) => setConfig(prev => ({ ...prev, selected_image_model: val })),
+                        customImageModel,
+                        setCustomImageModel,
+                        modelsStatus.image_model
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Action Buttons bar */}
+                <div style={{ borderTop: '1px solid var(--border)', paddingTop: '1.5rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    {config.llm_provider === 'local' && (
+                      <button 
+                        className="btn btn-secondary"
+                        onClick={() => {
+                          const textRepo = customTextModel || config.selected_text_model;
+                          const imageRepo = customImageModel || config.selected_image_model;
+                          triggerModelDownload(textRepo);
+                          triggerModelDownload(imageRepo);
+                        }}
+                      >
+                        <RefreshCw size={14} /> Download/Verify Both Caches
+                      </button>
+                    )}
+                  </div>
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                    {!canProceed && (
+                      <span style={{ fontSize: '0.85rem', color: 'var(--warning)', display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+                        <AlertCircle size={14} />
+                        {!isImageModelReady 
+                          ? "The Image Generation model cache must be verified to proceed."
+                          : config.llm_provider === 'local'
+                            ? "The Text Generation model cache must be verified to proceed."
+                            : "Please connect to the local server and select an available model to proceed."}
+                      </span>
+                    )}
+                    
+                    <button 
+                      className="btn btn-primary" 
+                      onClick={() => setActiveStep(2)}
+                      disabled={!canProceed}
+                      style={{ minWidth: '180px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
+                    >
+                      Proceed to Script Input <ChevronRight size={16} />
+                    </button>
+                  </div>
+                </div>
               </div>
-              <h2 style={{ fontSize: '1.5rem', marginBottom: '0.75rem' }}>Hugging Face Model Hub Setup</h2>
-              <p style={{ color: 'var(--text-secondary)', maxWidth: '500px', margin: '0 auto 2rem', fontSize: '0.95rem' }}>
-                To generate images locally, you must first verify that you have downloaded both a Text Generation LLM and an Image Generation model from Hugging Face.
-              </p>
-              
-              <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem' }}>
-                <button 
-                  className="btn btn-secondary"
-                  onClick={() => {
-                    const textRepo = customTextModel || config.selected_text_model;
-                    const imageRepo = customImageModel || config.selected_image_model;
-                    triggerModelDownload(textRepo);
-                    triggerModelDownload(imageRepo);
-                  }}
-                >
-                  <RefreshCw size={16} /> Download Both Selected Models
-                </button>
-                <button 
-                  className="btn btn-primary" 
-                  onClick={() => setActiveStep(2)}
-                  disabled={modelsStatus.image_model.status !== 'completed' || modelsStatus.text_model.status !== 'completed'}
-                >
-                  Proceed to Script Input <ChevronRight size={16} />
-                </button>
-              </div>
-              {(modelsStatus.image_model.status !== 'completed' || modelsStatus.text_model.status !== 'completed') && (
-                <span style={{ fontSize: '0.8rem', color: 'var(--warning)', marginTop: '0.75rem', display: 'block' }}>
-                  * Both Text and Image model downloads must be finished to proceed to step 2.
-                </span>
-              )}
-            </div>
-          )}
+            );
+          })()}
 
           {/* STEP 2: SCRIPT INPUT PANEL */}
           {activeStep === 2 && (
@@ -904,7 +1193,7 @@ export default function App() {
                 />
               </div>
 
-              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', width: '100%' }}>
                 <button 
                   className="btn btn-secondary" 
                   onClick={handleLoadSampleScript}
@@ -912,21 +1201,47 @@ export default function App() {
                 >
                   Load Sample Script
                 </button>
-                <button 
-                  className="btn btn-primary" 
-                  onClick={handleParseScript}
-                  disabled={isParsing || !scriptText.trim()}
-                >
-                  {isParsing ? (
-                    <>
-                      <Loader size={16} className="spinner" /> Analyzing Script with Local LLM...
-                    </>
-                  ) : (
-                    <>
-                      Analyze Script & Generate Visual Prompts <ChevronRight size={16} />
-                    </>
+                
+                <div style={{ display: 'flex', gap: '0.75rem' }}>
+                  {isParsing && (
+                    <button
+                      className="btn btn-secondary"
+                      style={{
+                        color: '#EF4444',
+                        borderColor: 'rgba(239, 68, 68, 0.3)',
+                        background: 'rgba(239, 68, 68, 0.05)',
+                        margin: 0
+                      }}
+                      onClick={async () => {
+                        try {
+                          const res = await fetch('/api/script/cancel', { method: 'POST' });
+                          if (res.ok) {
+                            showNotification('Script parsing cancel request sent.', 'warning');
+                          }
+                        } catch (err) {
+                          showNotification('Failed to cancel script parsing.', 'danger');
+                        }
+                      }}
+                    >
+                      Stop Parsing
+                    </button>
                   )}
-                </button>
+                  <button 
+                    className="btn btn-primary" 
+                    onClick={handleParseScript}
+                    disabled={isParsing || !scriptText.trim()}
+                  >
+                    {isParsing ? (
+                      <>
+                        <Loader size={16} className="spinner" /> Analyzing Script...
+                      </>
+                    ) : (
+                      <>
+                        Analyze Script & Generate Visual Prompts <ChevronRight size={16} />
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
             </div>
           )}

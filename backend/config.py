@@ -13,22 +13,34 @@ DEFAULT_CONFIG = {
     "selected_image_model": "stabilityai/sd-turbo",
     "num_inference_steps": 1,  # Default for sd-turbo
     "guidance_scale": 0.0,      # Default for sd-turbo (usually 0.0 or 1.0)
-    "use_gpu": False
+    "use_gpu": False,
+    "llm_provider": "local",
+    "ollama_url": "http://localhost:11434",
+    "ollama_model": "qwen2.5:3b",
+    "openai_url": "http://localhost:1234/v1",
+    "openai_model": "qwen2.5-3b-instruct"
 }
 
 def load_config():
+    config = DEFAULT_CONFIG
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
-                # Merge with default in case keys are missing
-                return {**DEFAULT_CONFIG, **config}
+                loaded = json.load(f)
+                config = {**DEFAULT_CONFIG, **loaded}
         except Exception:
-            return DEFAULT_CONFIG
-    return DEFAULT_CONFIG
+            pass
+            
+    # Set the token environment variable for global authentication
+    hf_token = config.get("hf_token", "")
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+    elif "HF_TOKEN" in os.environ:
+        del os.environ["HF_TOKEN"]
+        
+    return config
 
 def save_config(config_data):
-    # Ensure config structure is correct
     config = load_config()
     for key, value in config_data.items():
         if key in DEFAULT_CONFIG:
@@ -36,6 +48,14 @@ def save_config(config_data):
             
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
+        
+    # Keep the environment variable in sync after saving
+    hf_token = config.get("hf_token", "")
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+    elif "HF_TOKEN" in os.environ:
+        del os.environ["HF_TOKEN"]
+        
     return config
 
 # Ensure directories exist
